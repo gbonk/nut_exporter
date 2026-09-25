@@ -1,0 +1,207 @@
+package collectors
+
+import (
+"errors"
+"log/slog"
+"os"
+"regexp"
+"testing"
+
+"github.com/prometheus/client_golang/prometheus"
+dto "github.com/prometheus/client_model/go"
+)
+
+// --- Test Suite ---
+
+func TestNutCollector_Collect_EdgeCases(t *testing.T) {
+logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+tests := []struct {
+name           string
+opts           NutCollectorOpts
+mockClient     *fakeNutClient
+verifyMetrics  func(t *testing.T, metrics []prometheus.Metric)
+}
+{
+{
+name: "Success - Verifying Numeric Value Types",
+opts: NutCollectorOpts{Namespace: "test_ups", DisableDeviceInfo: true},
+mockClient: &fakeNutClient{
+disconnectFunc: func() error { return nil },
+getUPSListFunc: func() ([]NutUPS, error) {
+return []NutUPS{
+fakeNutUPS{
+name: "ups-1",
+variables: []NutVariable{
+{Name: "battery.charge", Value: int64(100), Type: "NUMBER", Description: "Battery charge percentage"},
+{Name: "ups.load", Value: float64(24.5), Type: "NUMBER", Description: "UPS Load"},
+},
+},
+}, nil
+},
+},
+verifyMetrics: func(t *testing.T, metrics []prometheus.Metric) {
+if len(metrics) != 2 {
+t.Fatalf("expected 2 metrics, got %d", len(metrics))
+}
+		// Helper to extract values
+		chargeVal := getMetricValue(t, metrics[0])
+		loadVal := getMetricValue(t, metrics[1])
+
+		if chargeVal != 100 {
+			t.Errorf("expected battery.charge to be 100, got %f", chargeVal)
+		}
+		if loadVal != 24.5 {
+			t.Errorf("expected ups.load to be 24.5, got %f", loadVal)
+		}
+	},
+},
+{
+	name: "Success - Status Flag Variations (ups.status Mapping)",
+	opts: NutCollectorOpts{Namespace: "test_ups", DisableDeviceInfo: true, Statuses: []string{"OL", "OB"}},
+	mockClient: &fakeNutClient{
+		disconnectFunc: func() error { return nil },
+		getUPSListFunc: func() ([]NutUPS, error) {
+			return []NutUPS{
+				fakeNutUPS{
+					name: "ups-1",
+					variables: []NutVariable{
+						{Name: "ups.status", Value: "OL CHRG", Type: "STRING", Description: "UPS Status"},
+					},
+				},
+			}, nil
+		},
+	},
+	verifyMetrics: func(t *testing.T, metrics []prometheus.Metric) {
+		// We expect 3 status metrics because: 
+		// "OL" and "CHRG" are present (value 1), and "OB" is explicitly requested in Opts but missing (value 0)
+		if len(metrics) != 3 {
+			t.Fatalf("expected 3 status metrics, got %d", len(metrics))
+		}
+		// You can iterate and match labels if you want deep structural validations
+	},
+},
+{
+	name: "Edge Case - Malformed/Unknown String Types (Regex Handling)",
+	opts: NutCollectorOpts{
+		Namespace:         "test_ups",
+		DisableDeviceInfo: true,
+		OnRegex:           "enabled",
+		OffRegex:          "disabled",
+	},
+	mockClient: &fakeNutClient{
+		disconnectFunc: func() error { return nil },
+		getUPSListFunc: func() ([]NutUPS, error) {
+			return []NutUPS{
+				fakeNutUPS{
+					name: "ups-1",
+					variables: []NutVariable{
+						{Name: "outlet.1.status", Value: "enabled", Type: "STRING", Description: "Outlet 1 status"},
+						{Name: "outlet.2.status", Value: "disabled", Type: "STRING", Description: "Outlet 2 status"},
+						{Name: "ups.mfr", Value: "UnknownBrand", Type: "STRING", Description: "Manufacturer string that cannot be cast"},
+					},
+				},
+			}, nil
+		},
+	},
+	verifyMetrics: func(t *testing.T, metrics []prometheus.Metric) {
+		// "UnknownBrand" cannot be converted to a binary numeric gauge, so it should be skipped safely.
+		// Therefore, only 2 valid metrics should be produced.
+		if len(metrics) != 2 {
+			t.Errorf("expected 2 metrics (coerced by regex), got %d. Non-numeric string was not dropped properly.", len(metrics))
+		}
+		
+		m1 := getMetricValue(t, metrics[0])
+		m2 := getMetricValue(t, metrics[1])
+
+		if m1 != 1 {
+			t.Errorf("expected enabled outlet to map to 1, got %f", m1)
+		}
+		if m2 != 0 {
+			t.Errorf("expected disabled outlet to map to 0, got %f", m2)
+		}
+	},
+},
+{
+	name: "Error - Multiple UPS Devices Detected Without Query Filter",
+	opts: NutCollectorOpts{Namespace: "test_ups", Ups: "", DisableDeviceInfo: true},
+	mockClient: &fakeNutClient{
+		getUPSListFunc: func() ([]NutUPS, error) {
+			return []NutUPS{
+				fakeNutUPS{name: "ups-alpha"},
+				fakeNutUPS{name: "ups-beta"},
+			}, nil
+		},
+	},
+	verifyMetrics: func(t *testing.T, metrics []prometheus.Metric) {
+		if len(metrics) != 1 {
+			t.Fatalf("expected 1 metric (InvalidMetric indicator), got %d", len(metrics))
+		}
+		// Confirm that an invalid metric description containing the targeted scrape string error is sent
+		desc := metrics[0].Desc().String()
+		if !regexp.MustCompile(`Multiple UPS devices were found`).MatchString(desc) {
+			t.Errorf("unexpected error payload message description: %s", desc)
+		}
+	},
+},
+
+}
+
+for _, tt := range tests {
+t.Run(tt.name, func(t *testing.T) {
+// Inject our behavior configuration map into a custom client factory bypass closure
+collector, err := NewNutCollector(tt.opts, logger)
+if err != nil {
+t.Fatalf("failed to build collector instantiation: %v", err)
+}
+	// Override the global connection hook pointing to our table's dynamic fakeClient config
+	nutConnectHook = func(server string, port ...int) (NutClient, error) {
+		return tt.mockClient, nil
+	}
+	// Reset hook to clean up state
+	defer func() { nutConnectHook = defaultNutConnect }()
+
+	metricChan := make(chan prometheus.Metric, 10)
+	
+	// Execute the collection cycle completely mock-isolated
+	collector.Collect(metricChan)
+	close(metricChan)
+
+	var gatheredMetrics []prometheus.Metric
+	for m := range metricChan {
+		gatheredMetrics = append(gatheredMetrics, m)
+	}
+
+	// Evaluate metrics gathered
+	tt.verifyMetrics(t, gatheredMetrics)
+})
+
+}
+
+}
+
+// --- Test Helper Functions ---
+
+// getMetricValue uses standard Prometheus diagnostic protobuf conversion wrappers to read real data out of an opaque metric type.
+func getMetricValue(t *testing.T, metric prometheus.Metric) float64 {
+t.Helper()
+var dtoMetric dto.Metric
+err := metric.Write(&dtoMetric)
+if err != nil {
+t.Fatalf("failed to read Prometheus metric description data payload: %v", err)
+}
+
+if dtoMetric.Gauge != nil {
+return *dtoMetric.Gauge.Value
+}
+if dtoMetric.Counter != nil {
+return *dtoMetric.Counter.Value
+}
+if dtoMetric.Untyped != nil {
+return *dtoMetric.Untyped.Value
+}
+
+t.Fatalf("metric type holds an unknown or unmapped inner numeric format value struct layout")
+return 0
+
+}

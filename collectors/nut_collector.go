@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -35,6 +36,9 @@ type NutCollectorOpts struct {
 }
 
 func NewNutCollector(opts NutCollectorOpts, logger *slog.Logger) (*NutCollector, error) {
+
+	logger.Debug("NewNutCollector: Start", "NutCollectionOps: ", opts)
+
 	deviceDesc := prometheus.NewDesc(prometheus.BuildFQName(opts.Namespace, "", "device_info"),
 		"UPS Device information",
 		deviceLabels, nil,
@@ -71,86 +75,126 @@ func NewNutCollector(opts NutCollectorOpts, logger *slog.Logger) (*NutCollector,
 	if opts.Ups != "" {
 		valid, err := collector.IsValidUPSName(opts.Ups)
 		if err != nil {
-			logger.Warn("Error detected while verifying UPS name - proceeding without validation", "error", err)
+			logger.Warn("NewNutCollector: Error detected while verifying UPS name - proceeding without validation", "error", err)
 		} else if !valid {
-			return nil, fmt.Errorf("%s UPS is not a valid name in the NUT server %s", opts.Ups, opts.Server)
+			return nil, fmt.Errorf("NewNutCollector:  %s UPS is not a valid name in the NUT server %s", opts.Ups, opts.Server)
 		}
 	}
 
-	logger.Info("collector configured", "variables", strings.Join(collector.opts.Variables, ","))
+	logger.Info("NewNutCollector:  collector configured", "variables", strings.Join(collector.opts.Variables, ","))
 	return collector, nil
 }
 
-func (c *NutCollector) Collect(ch chan<- prometheus.Metric) {
-	c.logger.Debug("Connecting to server", "server", c.opts.Server, "port", c.opts.ServerPort)
-	client, err := nut.Connect(c.opts.Server, c.opts.ServerPort)
+// The Testing Connection Hook ---
+
+// Define a function type that mirrors the signature of nut.Connect
+type connectFunc func(server string, port int) (NutClient, error)
+
+// defaultNutConnect dials the real network socket using the original library
+var defaultNutConnect connectFunc = func(server string, port int) (NutClient, error) {
+
+	slog.Debug("connectFunc: Performing Live Network connection")
+
+	client, err := nut.Connect(server, port)
+
 	if err != nil {
-		c.logger.Error("failed connecting to server", "err", err)
+
+		slog.Debug("connectFunc: Error Calling nut.Connect:", "err", err)
+
+		return nil, err
+	}
+	return &realNutClient{client: &client}, nil
+}
+
+// nutConnectHook is what your Collect() function calls.
+// In your test files, you will overwrite this variable with a mock connection closer!
+var nutConnectHook = defaultNutConnect
+
+func (c *NutCollector) Collect(ch chan<- prometheus.Metric) {
+	c.logger.Debug("Collect: Start")
+
+	c.logger.Debug("Collect: Connecting to server", "server", c.opts.Server, "port", c.opts.ServerPort)
+
+	client, err := nutConnectHook(c.opts.Server, c.opts.ServerPort)
+
+	if err != nil {
+		c.logger.Error("Collect: Error when calling nutConnectHook:", "err", err)
 		ch <- prometheus.NewInvalidMetric(
 			prometheus.NewDesc(prometheus.BuildFQName(c.opts.Namespace, "", "error"),
-				"Failure gathering UPS variables", nil, nil),
+				"Collect: Failure gathering UPS variables", nil, nil),
 			err)
 		return
 	}
 
 	defer client.Disconnect()
-	c.logger.Debug("Connected to server", "server", c.opts.Server)
+	c.logger.Debug("Collect: Connected to server", "server", c.opts.Server)
 
 	if c.opts.Username != "" && c.opts.Password != "" {
 		_, err = client.Authenticate(c.opts.Username, c.opts.Password)
 		if err == nil {
-			c.logger.Debug("Authenticated", "server", c.opts.Server, "user", c.opts.Username)
+			c.logger.Debug("Collect: Authenticated", "server", c.opts.Server, "user", c.opts.Username)
 		} else {
-			c.logger.Warn("Failed to authenticate to NUT server", "server", c.opts.Server, "user", c.opts.Username)
+			c.logger.Warn("Collect: Failed to authenticate to NUT server", "server", c.opts.Server, "user", c.opts.Username)
 			//Don't bail after logging the warning. Most NUT configurations do not require authn to read variables
 		}
 	}
 
-	upsList := []nut.UPS{}
+	upsList := []NutUPS{}
 	if c.opts.Ups != "" {
-		ups, err := nut.NewUPS(c.opts.Ups, &client)
-		if err == nil {
-			c.logger.Debug("Instantiated UPS", "name", c.opts.Ups)
-			upsList = append(upsList, ups)
-		} else {
-			c.logger.Error("Failure instantiating the UPS", "name", c.opts.Ups, "err", err)
+
+		c.logger.Debug("Collect: Opts UPS is", "ups", c.opts.Ups)
+
+		ups, err := client.NewUPS(c.opts.Ups)
+
+		if err != nil {
+			c.logger.Error("Collect: Failure instantiating the UPS", "name", c.opts.Ups, "err", err)
 			ch <- prometheus.NewInvalidMetric(
 				prometheus.NewDesc(prometheus.BuildFQName(c.opts.Namespace, "", "error"),
-					"Failure instantiating the UPS", nil, nil),
+					"Collect: Failure instantiating the UPS", nil, nil),
 				err)
 			return
 		}
+
+		c.logger.Debug("Collect: Instantiated UPS", "name", c.opts.Ups)
+		upsList = append(upsList, ups)
 	} else {
-		tmp, err := client.GetUPSList()
-		if err == nil {
-			c.logger.Debug("Obtained list of UPS devices")
-			upsList = tmp
-			for _, ups := range tmp {
-				c.logger.Debug("UPS name detection", "name", ups.Name)
-			}
-		} else {
-			c.logger.Error("Failure getting the list of UPS devices", "err", err)
+
+		c.logger.Debug("Collect: Opts UPS is empty")
+
+		upsList, err = client.GetUPSList()
+
+		if err != nil {
+
+			c.logger.Error("Collect: Failure getting the list of UPS devices", "err", err)
 			ch <- prometheus.NewInvalidMetric(
 				prometheus.NewDesc(prometheus.BuildFQName(c.opts.Namespace, "", "error"),
-					"Failure getting the list of UPS devices", nil, nil),
+					"Collect: Failure getting the list of UPS devices", nil, nil),
 				err)
 			return
+		}
+
+		c.logger.Debug("Collect: Obtained list of UPS devices")
+		//		upsList = tmp
+		for _, ups := range upsList {
+			c.logger.Debug("Collect: UPS name detection", "name", ups.GetName())
 		}
 	}
 
 	if len(upsList) > 1 {
-		c.logger.Error("Multiple UPS devices were found by NUT for this scrape. For this configuration, you MUST scrape this exporter with a query string parameter indicating which UPS to scrape. Valid values of ups are:")
+		c.logger.Error("Collect: Multiple UPS devices were found by NUT for this scrape. For this configuration, you MUST scrape this exporter with a query string parameter indicating which UPS to scrape. Valid values of ups are:")
 		for _, ups := range upsList {
-			c.logger.Error(ups.Name)
+			c.logger.Error(ups.GetName())
 		}
 		ch <- prometheus.NewInvalidMetric(
 			prometheus.NewDesc(prometheus.BuildFQName(c.opts.Namespace, "", "error"),
-				"Multiple UPS devices were found from NUT. Please add a ups=<name> query string", nil, nil),
+				"Collect:  Multiple UPS devices were found from NUT. Please add a ups=<name> query string", nil, nil),
 			err)
 		return
 	} else if len(upsList) == 1 {
 		//Set the name so subsequent scrapes don't have to look it up
-		c.opts.Ups = upsList[0].Name
+		c.opts.Ups = upsList[0].GetName()
+	} else if len(upsList) == 0 {
+		c.logger.Debug("Collect:  The length of upsList is now Zero")
 	}
 
 	for _, ups := range upsList {
@@ -160,37 +204,40 @@ func (c *NutCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 
 		c.logger.Debug(
-			"UPS info",
-			"name", ups.Name,
-			"description", ups.Description,
-			"master", ups.Master,
-			"nmumber_of_logins", ups.NumberOfLogins,
+			"Collect: UPS info",
+			"name", ups.GetName(),
+			"description", ups.GetDescription(),
+			"master", ups.GetMaster(),
+			"nmumber_of_logins", ups.GetNumberOfLogins(),
 		)
-		for i, clientName := range ups.Clients {
-			c.logger.Debug(fmt.Sprintf("client %d", i), "name", clientName)
+		for i, clientName := range ups.GetClients() {
+			c.logger.Debug(fmt.Sprintf("Collect: client %d", i), "name", clientName)
 		}
-		for _, command := range ups.Commands {
-			c.logger.Debug("ups command", "command", command.Name, "description", command.Description)
+		for _, command := range ups.GetCommands() {
+			c.logger.Debug("Collect: UPS Command", "command", command.Name, "description", command.Description)
 		}
-		for _, variable := range ups.Variables {
-			c.logger.Debug(
-				"Variable dump",
-				"variable_name", variable.Name,
-				"value", variable.Value,
-				"type", variable.Type,
-				"description", variable.Description,
-				"writeable", variable.Writeable,
-				"maximum_length", variable.MaximumLength,
-				"original_type", variable.OriginalType,
-			)
+		for _, variable := range ups.GetVariables() {
+			c.logger.Debug("Collect: Current UPS Variable: ", "variable", variable)
 			path := strings.Split(variable.Name, ".")
 			if path[0] == "device" {
 				device[path[1]] = fmt.Sprintf("%v", variable.Value)
 			}
 
 			/* Done special processing - now get as general as possible and gather all requested or number-like metrics */
-			if len(c.opts.Variables) == 0 || sliceContains(c.opts.Variables, variable.Name) {
-				c.logger.Debug("Export the variable? true")
+
+			// Check if the target matches any regex pattern in the slice
+			hasMatch := slices.ContainsFunc(c.opts.Variables, func(pattern string) bool {
+
+				c.logger.Debug("Collect: hasMatch", "pattern", pattern, "name", variable.Name)
+
+				matched, _ := regexp.MatchString(pattern, variable.Name)
+				return matched
+			})
+
+			//			if len(c.opts.Variables) == 0 || slices.Contains(c.opts.Variables, variable.Name) {
+			if hasMatch {
+				c.logger.Debug("Collect: Variable Name match found in variable filter.")
+				c.logger.Debug("Collect: Exporting Variable: " + variable.Name)
 				value := float64(0)
 
 				/* Deal with ups.status specially because it is a collection of 'flags' */
@@ -242,17 +289,17 @@ func (c *NutCollector) Collect(ch chan<- prometheus.Metric) {
 					   if this string could possible represent a binary value
 					*/
 					if c.onRegex != nil && c.onRegex.MatchString(variable.Value.(string)) {
-						c.logger.Debug("Converted string to 1 due to regex match", "value", variable.Value.(string))
+						c.logger.Debug("Collect: Converted string to 1 due to regex match", "value", variable.Value.(string))
 						value = float64(1)
 					} else if c.offRegex != nil && c.offRegex.MatchString(variable.Value.(string)) {
-						c.logger.Debug("Converted string to 0 due to regex match", "value", variable.Value.(string))
+						c.logger.Debug("Collect: Converted string to 0 due to regex match", "value", variable.Value.(string))
 						value = float64(0)
 					} else {
-						c.logger.Debug("Cannot convert string to binary 0/1", "value", variable.Value.(string))
+						c.logger.Debug("Collect: Cannot convert string to binary 0/1", "value", variable.Value.(string))
 						continue
 					}
 				default:
-					c.logger.Warn("Unknown variable type from nut client library", "name", variable.Name, "type", fmt.Sprintf("%T", v), "claimed_type", variable.Type, "value", v)
+					c.logger.Warn("Collect: Unknown variable type from nut client library", "name", variable.Name, "type", fmt.Sprintf("%T", v), "claimed_type", variable.Type, "value", v)
 					continue
 				}
 
@@ -265,10 +312,10 @@ func (c *NutCollector) Collect(ch chan<- prometheus.Metric) {
 					nil, nil,
 				)
 
-				c.logger.Debug("Collecting as prometheus metric", "name", fqName, "value", value)
+				c.logger.Debug("Collect: Collecting as prometheus metric", "name", fqName, "value", value)
 				ch <- prometheus.MustNewConstMetric(varDesc, prometheus.GaugeValue, value)
 			} else {
-				c.logger.Debug("Export the variable? false", "count", len(c.opts.Variables), "variables", strings.Join(c.opts.Variables, ","))
+				c.logger.Debug("Collect: Skipping variable: " + variable.Name)
 			}
 		}
 
@@ -289,22 +336,16 @@ func (c *NutCollector) Describe(ch chan<- *prometheus.Desc) {
 	}
 }
 
-func sliceContains(c []string, value string) bool {
-	for _, sliceValue := range c {
-		if sliceValue == value {
-			return true
-		}
-	}
-	return false
-}
-
 func (c *NutCollector) IsValidUPSName(upsName string) (bool, error) {
 	result := false
 
-	c.logger.Debug(fmt.Sprintf("Connecting to server and verifying `%s` is a valid UPS name", upsName), "server", c.opts.Server)
-	client, err := nut.Connect(c.opts.Server)
+	c.logger.Debug(fmt.Sprintf("IsValidUPSName: Connecting to server and verifying `%s` is a valid UPS name", upsName), "server", c.opts.Server)
+
+	//	client, err := nut.Connect(c.opts.Server)
+	client, err := nutConnectHook(c.opts.Server, c.opts.ServerPort)
+
 	if err != nil {
-		c.logger.Error("error while connecting to server", "err", err)
+		c.logger.Error("IsValidUPSName: error while connecting to server", "err", err)
 		return result, err
 	}
 
@@ -313,24 +354,24 @@ func (c *NutCollector) IsValidUPSName(upsName string) (bool, error) {
 	if c.opts.Username != "" && c.opts.Password != "" {
 		_, err = client.Authenticate(c.opts.Username, c.opts.Password)
 		if err != nil {
-			c.logger.Warn("Failed to authenticate to NUT server", "server", c.opts.Server, "user", c.opts.Username)
+			c.logger.Warn("IsValidUPSName: Failed to authenticate to NUT server", "server", c.opts.Server, "user", c.opts.Username)
 			//Don't bail after logging the warning. Most NUT configurations do not require authn to get the UPS list
 		}
 	}
 
-	tmp, err := client.GetUPSList()
+	upsList, err := client.GetUPSList()
 	if err != nil {
-		c.logger.Error("Failure getting the list of UPS devices", "err", err)
+		c.logger.Error("IsValidUPSName: Failure getting the list of UPS devices", "err", err)
 		return result, err
 	}
 
-	for _, ups := range tmp {
-		c.logger.Debug("UPS name detection", "name", ups.Name)
-		if ups.Name == upsName {
+	for _, ups := range upsList {
+		c.logger.Debug("IsValidUPSName: UPS name detection", "name", ups.GetName())
+		if ups.GetName() == upsName {
 			result = true
 		}
 	}
 
-	c.logger.Debug(fmt.Sprintf("Validity result for UPS named `%s`", upsName), "valid", result)
+	c.logger.Debug(fmt.Sprintf("IsValidUPSName: Validity result for UPS named `%s`", upsName), "valid", result)
 	return result, nil
 }

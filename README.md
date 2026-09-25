@@ -258,3 +258,5 @@ To install the [Helm](https://helm.sh/docs/) chart into a Kubernetes cluster run
 helm repo add nut-exporter https://DRuggeri.github.io/nut_exporter
 helm install nut-exporter/nut-exporter nut-exporter
 ```
+# Connecting Remotely
+

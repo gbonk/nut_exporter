@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"testing"
@@ -18,8 +20,49 @@ const (
 	address = "localhost:19100"
 )
 
+func TestMetricsHandler_ServeHTTP(t *testing.T) {
+	// 1. Initialize your handler with any required state or dependencies
+	handler := &upsNutMetricsHandler{
+
+		handlers: make(map[string]*http.Handler),
+	}
+
+	initLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	// 2. Create a mock HTTP request targeting your endpoint
+	req := httptest.NewRequest(http.MethodGet, "/metrics?server=nut-lv.bonk.cc", nil)
+
+	// 3. Create a ResponseRecorder to capture the HTTP response
+	rr := httptest.NewRecorder()
+
+	// 4. Directly invoke the ServeHTTP method on your handler
+	handler.ServeHTTP(rr, req)
+
+	// 5. Assertions: Check if the outcome matches your expectations
+
+	// Check the HTTP status code
+	expectedStatus := http.StatusOK
+	if status := rr.Code; status != expectedStatus {
+		t.Errorf("handler returned wrong status code: got %v want %v", status, expectedStatus)
+	}
+
+	// Check the response body
+	expectedBody := "expected metrics output here" // Change this to your actual expected output
+	if rr.Body.String() != expectedBody {
+		t.Errorf("handler returned unexpected body: got %v want %v", rr.Body.String(), expectedBody)
+	}
+
+	// Optional: Check HTTP response headers if your handler sets them
+	// expectedContentType := "text/plain; version=0.0.4"
+	// if ctype := rr.Header().Get("Content-Type"); ctype != expectedContentType {
+	// 	t.Errorf("handler returned wrong content type: got %v want %v", ctype, expectedContentType)
+	// }
+}
+
 func TestSuccessfulLaunch(t *testing.T) {
-	if _, err := os.Stat(binary); err != nil {
+	if _, err := exec.LookPath(binary); err != nil {
+		//	if _, err := os.Stat(binary); err != nil {
+		t.Error(err)
 		return
 	}
 

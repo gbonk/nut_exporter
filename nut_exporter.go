@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"nut/collectors"
 	"os"
 	"strconv"
 	"strings"
@@ -15,9 +16,30 @@ import (
 	promcollectors "github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/exporter-toolkit/web"
 	"github.com/prometheus/exporter-toolkit/web/kingpinflag"
-
-	"github.com/DRuggeri/nut_exporter/v3/collectors"
 )
+
+func init() {
+	// // Override Go's global resolver
+	// net.DefaultResolver = &net.Resolver{
+	// 	PreferGo: true, // Forces Go's native DNS resolver over CGO
+	// 	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+	// 		// address will contain the DNS server being hit (e.g., "127.0.0.53:53")
+	// 		fmt.Printf("🔍 [Global Resolver] Intercepted network lookup query at %s\n", time.Now().Format(time.RFC3339Nano))
+	// 		slog.Debug("🔍 Context", "ctx", ctx, "network", network, "address", address)
+
+	// 		// Dial out using a standard dialer to fulfill the original query
+	// 		d := net.Dialer{}
+	// 		return d.DialContext(ctx, network, address)
+	// 	},
+	// }
+
+	// net.Dialer = &net.Dialer{
+	// 	Control: func(network, address string, c syscall.RawConn) error {
+	// 		fmt.Printf("🎯 Dialing address: %s over %s\n", address, network)
+	// 		return nil
+	// 	},
+	// }
+}
 
 var Version = "testing"
 
@@ -61,7 +83,7 @@ var (
 
 	tookitFlags = kingpinflag.AddFlags(kingpin.CommandLine, ":9199")
 
-	metricsPath = kingpin.Flag(
+	upsNutMetricsPath = kingpin.Flag(
 		"web.telemetry-path", "Path under which to expose the UPS Prometheus metrics ($NUT_EXPORTER_WEB_TELEMETRY_PATH)",
 	).Envar("NUT_EXPORTER_WEB_TELEMETRY_PATH").Default("/ups_metrics").String()
 
@@ -74,26 +96,37 @@ var (
 	).Envar("NUT_EXPORTER_PRINT_METRICS").Default("false").Bool()
 
 	logLevel = kingpin.Flag(
-		"log.level", "Minimum log level for messages. One of error, warn, info, or debug. Default: info ($NETGEAR_EXPORTER_LOG_LEVEL)",
-	).Envar("NUT_EXPORTER__LOG_LEVEL").Default("info").String()
+		"log.level", "Minimum log level for messages. One of error, warn, info, or debug. Default: info ($NUT_EXPORTER_LOG_LEVEL)",
+	).Envar("NUT_EXPORTER_LOG_LEVEL").Default("info").String()
 
 	logJson = kingpin.Flag(
-		"log.json", "Format log lines as JSON. Default: false ($NETGEAR_EXPORTER_LOG_JSON)",
+		"log.json", "Format log lines as JSON. Default: false ($NUT_EXPORTER_LOG_LEVEL_JSON)",
 	).Envar("NUT_EXPORTER__LOG_JSON").Bool()
 )
+
 var collectorOpts collectors.NutCollectorOpts
 
-var logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+var logger *slog.Logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+func initLogger(loggerA *slog.Logger) {
+	logger = loggerA
+}
 
 func init() {
 	prometheus.MustRegister(promcollectors.NewBuildInfoCollector())
 }
 
-type metricsHandler struct {
+type upsNutMetricsHandler struct {
 	handlers map[string]*http.Handler
 }
 
-func (h *metricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *upsNutMetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+
+	logger.Debug("ServeHTTP: Received Request: " + r.URL.Path)
+	if len(r.URL.Query()) > 0 {
+		logger.Debug("ServeHTTP: Received Query: ", "query", r.URL.Query())
+	}
+
 	thisCollectorOpts := collectorOpts
 	thisCollectorOpts.Ups = r.URL.Query().Get("ups")
 
@@ -102,8 +135,11 @@ func (h *metricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.URL.Query().Get("serverport") != "" {
-		if port, err := strconv.Atoi(r.URL.Query().Get("serverport")); err != nil {
+		port, err := strconv.Atoi(r.URL.Query().Get("serverport"))
+		if err == nil {
 			thisCollectorOpts.ServerPort = port
+		} else {
+			logger.Error("ServeHTTP: Unable to convert query serverport to int", "err", err)
 		}
 	}
 
@@ -123,14 +159,16 @@ func (h *metricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		thisCollectorOpts.Statuses = strings.Split(r.URL.Query().Get("statuses"), ",")
 	}
 
+	logger.Debug("ServeHTTP: Local Collector Opts:", "ops", thisCollectorOpts)
+
 	var promHandler http.Handler
 	cacheName := fmt.Sprintf("%s:%d/%s", thisCollectorOpts.Server, thisCollectorOpts.ServerPort, thisCollectorOpts.Ups)
 	if tmp, ok := h.handlers[cacheName]; ok {
-		logger.Debug(fmt.Sprintf("Using existing handler for UPS `%s`", cacheName))
+		logger.Debug(fmt.Sprintf("ServeHTTP: Using existing handler for UPS `%s`", cacheName))
 		promHandler = *tmp
 	} else {
 		//Build a custom registry to include only the UPS metrics on the UPS metrics path
-		logger.Info(fmt.Sprintf("Creating new registry, handler, and collector for UPS `%s`", cacheName))
+		logger.Info(fmt.Sprintf("ServeHTTP: Creating new registry, handler, and collector for UPS `%s`", cacheName))
 		registry := prometheus.NewRegistry()
 		promHandler = promhttp.HandlerFor(registry, promhttp.HandlerOpts{Registry: registry})
 		promHandler = promhttp.InstrumentMetricHandler(registry, promHandler)
@@ -139,7 +177,7 @@ func (h *metricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte("500 - InternalServer Error"))
-			logger.Error("Internal server error", "err", err)
+			logger.Error("ServeHTTP:  Internal server error", "err", err)
 			return
 		}
 		registry.MustRegister(nutCollector)
@@ -169,11 +207,11 @@ func main() {
 	}
 	if *logJson {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, opts))
-		slog.SetDefault(logger)
 	} else {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, opts))
-		slog.SetDefault(logger)
 	}
+
+	slog.SetDefault(logger)
 
 	if *nutUsername != "" {
 		logger.Debug("Authenticating to NUT server")
@@ -227,6 +265,8 @@ func main() {
 		OffRegex:          *offRegex,
 	}
 
+	fmt.Printf("CollectorOps from CMD Line: %#v\n", collectorOpts)
+
 	if *printMetrics {
 		/* Make a channel and function to send output along */
 		var out chan *prometheus.Desc
@@ -258,18 +298,19 @@ func main() {
 
 	logger.Info("Starting nut_exporter", "version", Version)
 
-	handler := &metricsHandler{
+	upsNutHandler := &upsNutMetricsHandler{
 		handlers: make(map[string]*http.Handler),
 	}
 
-	http.Handle(*metricsPath, handler)
+	http.Handle(*upsNutMetricsPath, upsNutHandler)
 	http.Handle(*exporterMetricsPath, promhttp.Handler())
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
              <head><title>NUT Exporter</title></head>
              <body>
              <h1>NUT Exporter</h1>
-             <p><a href='` + *metricsPath + `'>UPS metrics</a></p>
+             <p><a href='` + *upsNutMetricsPath + `'>UPS metrics</a></p>
              <p><a href='` + *exporterMetricsPath + `'>Exporter metrics</a></p>
              </body>
              </html>`))
