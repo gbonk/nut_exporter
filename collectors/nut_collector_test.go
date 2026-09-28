@@ -14,25 +14,28 @@ func TestNutCollector_Collect(t *testing.T) {
 
 	pmChan := make(chan prometheus.Metric, 10)
 
+	t.Cleanup(func() {
+		close(pmChan) // Unblocks any goroutine waiting on <-ch
+	})
+
 	go func() {
 		for item := range pmChan {
 			// Optional: Assert things about 'item' here if needed
-			slogger.Info("Item Description: " + item.Desc().String())
+			slogger.Info("Channel Item Description: " + item.Desc().String())
 		}
 	}()
 
 	tests := []struct {
-		name string // description of this test case
-		// Named input parameters for receiver constructor.
-		opts   NutCollectorOpts
-		logger *slog.Logger
-		// Named input parameters for target function.
+		name       string // description of this test case
+		opts       NutCollectorOpts
+		logger     *slog.Logger
 		ch         chan<- prometheus.Metric
 		mockClient *fakeNutClient
 	}{
 		// Test cases
 		{
 			name:   "Error - Multiple UPS Devices Detected Without Query Filter",
+			ch:     pmChan,
 			opts:   NutCollectorOpts{Namespace: "test_ups", Ups: "", DisableDeviceInfo: true},
 			logger: slogger,
 			mockClient: &fakeNutClient{
@@ -76,10 +79,13 @@ func TestNutCollector_Collect_Live(t *testing.T) {
 
 	pmChan := make(chan prometheus.Metric, 10)
 
+	t.Cleanup(func() {
+		close(pmChan) // Unblocks any goroutine waiting on <-ch
+	})
 	go func() {
 		for item := range pmChan {
 			// Optional: Assert things about 'item' here if needed
-			slogger.Info("Item Description: " + item.Desc().String())
+			slogger.Info("Channel Description: " + item.Desc().String())
 		}
 	}()
 

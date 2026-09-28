@@ -113,6 +113,13 @@ var nutConnectHook = defaultNutConnect
 func (c *NutCollector) Collect(ch chan<- prometheus.Metric) {
 	c.logger.Debug("Collect: Start")
 
+	if ch == nil {
+
+		c.logger.Error("Collect: Channel 'ch'is nil")
+		panic("Collect: Channel 'ch'is nil")
+
+	}
+
 	c.logger.Debug("Collect: Connecting to server", "server", c.opts.Server, "port", c.opts.ServerPort)
 
 	client, err := nutConnectHook(c.opts.Server, c.opts.ServerPort)
