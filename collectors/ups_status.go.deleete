@@ -1,0 +1,85 @@
+package collectors
+
+import (
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// Define all possible valid states for your UPS test
+var validStates = []string{"success", "failure", "in_progress", "aborted"}
+
+type UPSCollector struct {
+	statusGauge *prometheus.GaugeVec
+	timeGauge   *prometheus.GaugeVec
+}
+
+func NewUPSCollector(reg prometheus.Registerer) *UPSCollector {
+	c := &UPSCollector{
+		statusGauge: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "ups_battery_test_status",
+				Help: "Status of the daily UPS battery test (value 1 for active state, 0 otherwise).",
+			},
+			[]string{"ups_id", "status"}, // Labels
+		),
+		timeGauge: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "ups_battery_test_last_timestamp_seconds",
+				Help: "Unix timestamp of the last executed UPS battery test.",
+			},
+			[]string{"ups_id"}, // Labels
+		),
+	}
+
+	// Register metrics with the provided registry
+	reg.MustRegister(c.statusGauge)
+	reg.MustRegister(c.timeGauge)
+
+	return c
+}
+
+// UpdateMetrics updates the gauges safely. It sets the active state to 1
+// and explicitly clears out/sets all other states to 0 for that UPS.
+func (c *UPSCollector) UpdateMetrics(upsID string, activeState string) {
+	// 1. Update the timestamp of the execution
+	c.timeGauge.WithLabelValues(upsID).Set(float64(time.Now().Unix()))
+
+	// 2. Loop through all possible states to ensure mutual exclusivity
+	for _, state := range validStates {
+		if state == activeState {
+			c.statusGauge.WithLabelValues(upsID, state).Set(1)
+		} else {
+			c.statusGauge.WithLabelValues(upsID, state).Set(0)
+		}
+	}
+}
+
+func main() {
+	// Create a non-global registry
+	reg := prometheus.NewRegistry()
+	upsCollector := NewUPSCollector(reg)
+
+	// Simulate receiving a metric update from your UPS polling logic
+	// In reality, you would trigger this inside your application cron/polling loop
+	go func() {
+		log.Println("Simulating initial state: in_progress")
+		upsCollector.UpdateMetrics("rack_1_ups_a", "in_progress")
+
+		time.Sleep(10 * time.Second) // Simulate test duration
+
+		log.Println("Simulating final state: success")
+		upsCollector.UpdateMetrics("rack_1_ups_a", "success")
+	}()
+
+	// Expose the registered metrics via HTTP
+	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+
+	log.Println("Starting metrics server on :8080/metrics")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatalf("Error starting HTTP server: %v", err)
+	}
+}

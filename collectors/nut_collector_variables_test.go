@@ -23,6 +23,34 @@ func TestNutCollector_Collect_variables(t *testing.T) {
 		verifyMetrics func(t *testing.T, metrics []prometheus.Metric)
 	}{
 		{
+			name: "battery.date",
+			opts: NutCollectorOpts{Namespace: "test_ups", DisableDeviceInfo: true, Variables: []string{".*"}},
+			mockClient: &fakeNutClient{
+				//				disconnectFunc: func() error { return nil },
+				getUPSListFunc: func() ([]NutUPS, error) {
+					return []NutUPS{
+						fakeNutUPS{
+							name: "ups-1",
+							variables: []NutVariable{
+								{Name: "battery.date", Value: "2001/09/25", Type: "STRING", Description: "Battery change date", Writeable: false, MaximumLength: 0, OriginalType: "NUMBER"},
+							},
+						},
+					}, nil
+				},
+			},
+			verifyMetrics: func(t *testing.T, metrics []prometheus.Metric) {
+				if len(metrics) != 1 {
+					t.Fatalf("expected 1 metrics, got %d", len(metrics))
+				}
+				// Helper to extract values
+				chargeVal := getMetricValue(t, metrics[0])
+
+				if chargeVal != 100 {
+					t.Errorf("expected battery.date to be a string date, got %f", chargeVal)
+				}
+			},
+		},
+		{
 			name: "battery.charge",
 			opts: NutCollectorOpts{Namespace: "test_ups", DisableDeviceInfo: true, Variables: []string{".*"}},
 			mockClient: &fakeNutClient{
@@ -48,7 +76,6 @@ func TestNutCollector_Collect_variables(t *testing.T) {
 				if chargeVal != 100 {
 					t.Errorf("expected battery.charge to be 100, got %f", chargeVal)
 				}
-
 			},
 		},
 		{

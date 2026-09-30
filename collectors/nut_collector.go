@@ -1,15 +1,23 @@
 package collectors
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	nut "github.com/robbiet480/go.nut"
 )
+
+var prioritizedLayouts = []string{
+	"2006-01-02", // ISO format (Standard 4-digit year)
+	"2006/01/02", // ISO variation
+	"2006.01.02", // ISO variation
+}
 
 var deviceLabels = []string{"model", "mfr", "serial", "type", "description", "contact", "location", "part", "macaddr"}
 
@@ -244,8 +252,13 @@ func (c *NutCollector) Collect(ch chan<- prometheus.Metric) {
 			//			if len(c.opts.Variables) == 0 || slices.Contains(c.opts.Variables, variable.Name) {
 			if hasMatch {
 				c.logger.Debug("Collect: Variable Name match found in variable filter.")
-				c.logger.Debug("Collect: Exporting Variable: " + variable.Name)
+				c.logger.Debug("Collect: Attempting to Convert Variable into prometheus metric: " + variable.Name)
 				value := float64(0)
+
+				if variable.Name == "ups.test.result" {
+					c.UpdateUpsTestResultMetric(ch, variable)
+					continue
+				}
 
 				/* Deal with ups.status specially because it is a collection of 'flags' */
 				if variable.Name == "ups.status" {
@@ -260,7 +273,7 @@ func (c *NutCollector) Collect(ch chan<- prometheus.Metric) {
 						ch <- prometheus.MustNewConstMetric(varDesc, prometheus.GaugeValue, float64(1), statusFlag)
 					}
 
-					/* If the user specifies the statues that must always be set, handle that here */
+					/* If the user specifies the statuses (stati?) that must always be set, handle that here */
 					if len(c.opts.Statuses) > 0 {
 						for _, status := range c.opts.Statuses {
 							/* This status flag was set because we saw it in the output... skip it */
@@ -271,6 +284,27 @@ func (c *NutCollector) Collect(ch chan<- prometheus.Metric) {
 						}
 					}
 					continue
+				}
+				// Convert from dot case to snake case now. In the case of date Going to append '_seconds'
+				name := strings.ReplaceAll(variable.Name, ".", "_")
+				name = strings.ReplaceAll(name, "-", "_")
+
+				if strings.HasSuffix(variable.Name, ".date") {
+
+					anyValueString, ok := variable.Value.(string)
+					if !ok {
+						c.logger.Debug("Collect: date suffix name match missing string value", "value", variable.Value)
+					}
+
+					varDate, err := Parse4DigitDate(anyValueString)
+					if err != nil {
+						c.logger.Error("Collect: date suffix name value isn't a valid date format", "value", anyValueString)
+					}
+
+					name = name + "_seconds"
+
+					variable.Value = varDate.Unix()
+
 				}
 
 				/* This is overkill - the library only deals with bool, string, int64 and float64 */
@@ -309,9 +343,6 @@ func (c *NutCollector) Collect(ch chan<- prometheus.Metric) {
 					c.logger.Warn("Collect: Unknown variable type from nut client library", "name", variable.Name, "type", fmt.Sprintf("%T", v), "claimed_type", variable.Type, "value", v)
 					continue
 				}
-
-				name := strings.ReplaceAll(variable.Name, ".", "_")
-				name = strings.ReplaceAll(name, "-", "_")
 
 				fqName := prometheus.BuildFQName(c.opts.Namespace, "", name)
 				varDesc := prometheus.NewDesc(fqName,
@@ -381,4 +412,16 @@ func (c *NutCollector) IsValidUPSName(upsName string) (bool, error) {
 
 	c.logger.Debug(fmt.Sprintf("IsValidUPSName: Validity result for UPS named `%s`", upsName), "valid", result)
 	return result, nil
+}
+
+// IsValidDate checks if the input string can be parsed into a valid date
+// using the specified layout.
+func Parse4DigitDate(dateStr string) (time.Time, error) {
+	for _, layout := range prioritizedLayouts {
+		// time.Parse requires an exact match for structural characters and token length
+		if t, err := time.Parse(layout, dateStr); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, errors.New("date does not match a recognized 4-digit year format")
 }
