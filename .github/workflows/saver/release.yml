@@ -2,9 +2,8 @@
 
 name: Release
 on:
-  - workflow_dispatch
-#  - push
-#  - pull_request
+  - push
+  - pull_request
 
 env:
   DOCKERHUB_USERNAME: druggeri
@@ -15,18 +14,18 @@ jobs:
     strategy:
       matrix:
         go-version:
-          - '1.27.x'
+          - '1.23.x'
         os:
           - ubuntu-latest
-#          - macos-latest
-#          - windows-latest
+          - macos-latest
+          - windows-latest
     runs-on: ${{ matrix.os }}
 
     steps:
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.27'
+          go-version: '1.23'
 
       - name: Checkout code
         uses: actions/checkout@v4

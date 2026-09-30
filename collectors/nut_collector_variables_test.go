@@ -45,8 +45,8 @@ func TestNutCollector_Collect_variables(t *testing.T) {
 				// Helper to extract values
 				chargeVal := getMetricValue(t, metrics[0])
 
-				if chargeVal != 100 {
-					t.Errorf("expected battery.date to be a string date, got %f", chargeVal)
+				if chargeVal != 1001376000 {
+					t.Errorf("expected battery.date to be a seconds value date, got %f", chargeVal)
 				}
 			},
 		},
